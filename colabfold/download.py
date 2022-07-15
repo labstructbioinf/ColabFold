@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 # The data dir location logic switches between a version with and one without "params" because alphafold
 # always internally joins "params". (We should probably patch alphafold)
-default_data_dir = Path(appdirs.user_cache_dir(__package__ or "colabfold"))
+default_data_dir = Path('/home/db/af2/')
 
 
 def download_alphafold_params(model_type: str, data_dir: Path = default_data_dir):
