@@ -300,6 +300,12 @@ def batch_input(
     )  # template_mask (4, 4) second value
     return input_fix
 
+to_np = lambda a: np.asarray(a)
+def class_to_np(c):
+  class dict2obj():
+    def __init__(self, d):
+      for k,v in d.items(): setattr(self, k, to_np(v))
+  return dict2obj(c.__dict__)
 
 def predict_structure(
     prefix: str,
@@ -314,6 +320,7 @@ def predict_structure(
     do_relax: bool = False,
     rank_by: str = "auto",
     random_seed: int = 0,
+    num_seeds: int = 1,
     stop_at_score: float = 100,
     stop_at_score_below: float = 0,
     prediction_callback: Callable[[Any, Any, Any, Any, Any], Any] = None,
@@ -332,174 +339,176 @@ def predict_structure(
 
     model_names = []
     for (model_name, model_runner, params) in model_runner_and_params:
-        logger.info(f"Running {model_name}")
-        model_names.append(model_name)
         # swap params to avoid recompiling
         # note: models 1,2 have diff number of params compared to models 3,4,5 (this was handled on construction)
         model_runner.params = params
 
-        processed_feature_dict = model_runner.process_features(
-            feature_dict, random_seed=random_seed
-        )
-        if not is_complex:
-            input_features = batch_input(
-                processed_feature_dict,
-                model_runner,
-                model_name,
-                crop_len,
-                use_templates,
-            )
-        else:
-            input_features = processed_feature_dict
+        for seed in range(random_seed, random_seed+num_seeds):
+            model_names.append(f"{model_name}_seed{seed}")
+            logger.info(f"Running {model_names[-1]}")
 
-        start = time.time()
-
-        # The original alphafold only returns the prediction_result,
-        # but our patched alphafold also returns a tuple (recycles,tol)
-        prediction_result, recycles = model_runner.predict(
-            input_features, random_seed=random_seed
-        )
-
-        prediction_time = time.time() - start
-        prediction_times.append(prediction_time)
-
-        mean_plddt = np.mean(prediction_result["plddt"][:seq_len])
-        mean_ptm = prediction_result["ptm"]
-        if rank_by == "plddt":
-            mean_score = mean_plddt
-        else:
-            mean_score = mean_ptm
-
-        if is_complex or model_type == "AlphaFold2-ptm":
-            if model_type.startswith("AlphaFold2-multimer"):
-                mean_iptm = prediction_result["iptm"]
-                logger.info(
-                    f"{model_name} took {prediction_time:.1f}s ({recycles} recycles) "
-                    f"with pLDDT {mean_plddt:.3g}, ptmscore {mean_ptm:.3g} and iptm {mean_iptm:.3g}"
+            processed_feature_dict = model_runner.process_features(feature_dict, random_seed=seed)
+            if not is_complex:
+                input_features = batch_input(
+                    processed_feature_dict,
+                    model_runner,
+                    model_name,
+                    crop_len,
+                    use_templates,
                 )
             else:
-                logger.info(
-                    f"{model_name} took {prediction_time:.1f}s ({recycles} recycles) "
-                    f"with pLDDT {mean_plddt:.3g} and ptmscore {mean_ptm:.3g}"
-                )
-        else:
-            logger.info(
-                f"{model_name} took {prediction_time:.1f}s ({recycles} recycles) "
-                f"with pLDDT {mean_plddt:.3g}"
-            )
-        final_atom_mask = prediction_result["structure_module"]["final_atom_mask"]
-        b_factors = prediction_result["plddt"][:, None] * final_atom_mask
-        if is_complex and model_type == "AlphaFold2-ptm":
-            input_features["asym_id"] = feature_dict["asym_id"]
-            input_features["aatype"] = input_features["aatype"][0]
-            input_features["residue_index"] = input_features["residue_index"][0]
-            curr_residue_index = 1
-            res_index_array = input_features["residue_index"].copy()
-            res_index_array[0] = 0
-            for i in range(1, input_features["aatype"].shape[0]):
-                if (
-                    input_features["residue_index"][i]
-                    - input_features["residue_index"][i - 1]
-                ) > 1:
-                    curr_residue_index = 0
-                res_index_array[i] = curr_residue_index
-                curr_residue_index += 1
-            input_features["residue_index"] = res_index_array
-
-        unrelaxed_protein = protein.from_prediction(
-            features=input_features,
-            result=prediction_result,
-            b_factors=b_factors,
-            remove_leading_feature_dimension=not is_complex,
-        )
-
-        if prediction_callback is not None:
-            prediction_callback(
-                unrelaxed_protein,
-                sequences_lengths,
-                prediction_result,
-                input_features,
-                (model_name, False),
-            )
-
-        protein_lines = protein.to_pdb(unrelaxed_protein)
-        unrelaxed_pdb_path = result_dir.joinpath(f"{prefix}_unrelaxed_{model_name}.pdb")
-        unrelaxed_pdb_path.write_text(protein_lines)
-
-        representations.append(prediction_result.get("representations", None))
-        unrelaxed_pdb_lines.append(protein_lines)
-        plddts.append(prediction_result["plddt"][:seq_len])
-        ptmscore.append(prediction_result["ptm"])
-        if model_type.startswith("AlphaFold2-multimer"):
-            iptmscore.append(prediction_result["iptm"])
-        max_paes.append(prediction_result["max_predicted_aligned_error"].item())
-        paes_res = []
-
-        for i in range(seq_len):
-            paes_res.append(prediction_result["predicted_aligned_error"][i][:seq_len])
-        paes.append(paes_res)
-
-        if do_relax:
-            patch_openmm()
-
-            from alphafold.common import residue_constants
-            from alphafold.relax import relax
+                input_features = processed_feature_dict
 
             start = time.time()
 
-            ###
-            # stereo_chemical_props.txt is from openstructure, see openstructure/README.md
-            # Hack so that we don't need to load the file into the alphafold package
-            stereo_chemical_props = (
-                Path(__file__)
-                .parent.absolute()
-                .joinpath("openstructure", "stereo_chemical_props.txt")
+            # The original alphafold only returns the prediction_result,
+            # but our patched alphafold also returns a tuple (recycles,tol)
+            prediction_result, recycles = model_runner.predict(input_features, random_seed=seed)
+
+            prediction_time = time.time() - start
+            prediction_times.append(prediction_time)
+
+            mean_plddt = np.mean(prediction_result["plddt"][:seq_len])
+            mean_ptm = prediction_result["ptm"]
+            if rank_by == "plddt":
+                mean_score = mean_plddt
+            else:
+                mean_score = mean_ptm
+
+            if is_complex or model_type == "AlphaFold2-ptm":
+                if model_type.startswith("AlphaFold2-multimer"):
+                    mean_iptm = prediction_result["iptm"]
+                    logger.info(
+                        f"{model_names[-1]} took {prediction_time:.1f}s ({recycles} recycles) "
+                        f"with pLDDT {mean_plddt:.3g}, ptmscore {mean_ptm:.3g} and iptm {mean_iptm:.3g}"
+                    )
+                else:
+                    logger.info(
+                        f"{model_names[-1]} took {prediction_time:.1f}s ({recycles} recycles) "
+                        f"with pLDDT {mean_plddt:.3g} and ptmscore {mean_ptm:.3g}"
+                    )
+            else:
+                logger.info(
+                    f"{model_names[-1]} took {prediction_time:.1f}s ({recycles} recycles) "
+                    f"with pLDDT {mean_plddt:.3g}"
+                )
+            final_atom_mask = prediction_result["structure_module"]["final_atom_mask"]
+            b_factors = prediction_result["plddt"][:, None] * final_atom_mask
+            if is_complex and model_type == "AlphaFold2-ptm":
+                input_features["asym_id"] = feature_dict["asym_id"]
+                input_features["aatype"] = input_features["aatype"][0]
+                input_features["residue_index"] = input_features["residue_index"][0]
+                curr_residue_index = 1
+                res_index_array = input_features["residue_index"].copy()
+                res_index_array[0] = 0
+                for i in range(1, input_features["aatype"].shape[0]):
+                    if (
+                        input_features["residue_index"][i]
+                        - input_features["residue_index"][i - 1]
+                    ) > 1:
+                        curr_residue_index = 0
+                    res_index_array[i] = curr_residue_index
+                    curr_residue_index += 1
+                input_features["residue_index"] = res_index_array
+
+            unrelaxed_protein = protein.from_prediction(
+                features=input_features,
+                result=prediction_result,
+                b_factors=b_factors,
+                remove_leading_feature_dimension=not is_complex,
             )
-
-            residue_constants.stereo_chemical_props_path = stereo_chemical_props
-
-            # Remove the padding because unlike to_pdb() amber doesn't handle that
-            remove_padding_mask = np.array(unrelaxed_protein.atom_mask.sum(axis=-1) > 0)
-            unrelaxed_protein = Protein(
-                atom_mask=unrelaxed_protein.atom_mask[remove_padding_mask],
-                atom_positions=unrelaxed_protein.atom_positions[remove_padding_mask],
-                aatype=unrelaxed_protein.aatype[remove_padding_mask],
-                residue_index=unrelaxed_protein.residue_index[remove_padding_mask],
-                b_factors=unrelaxed_protein.b_factors[remove_padding_mask],
-                chain_index=unrelaxed_protein.chain_index[remove_padding_mask],
-            )
-
-            # Relax the prediction.
-            amber_relaxer = relax.AmberRelaxation(
-                max_iterations=0,
-                tolerance=2.39,
-                stiffness=10.0,
-                exclude_residues=[],
-                max_outer_iterations=20,
-                use_gpu=use_gpu_relax,
-            )
-            relaxed_pdb_str, _, _ = amber_relaxer.process(prot=unrelaxed_protein)
-
-            relax_time = time.time() - start
-            relax_times.append(relax_time)
-
-            logger.info(f"Relaxation took {relax_time:.1f}s")
+            unrelaxed_protein = class_to_np(unrelaxed_protein)
 
             if prediction_callback is not None:
                 prediction_callback(
-                    protein.from_pdb_string(relaxed_pdb_str),
+                    unrelaxed_protein,
                     sequences_lengths,
                     prediction_result,
                     input_features,
-                    (model_name, True),
+                    (model_name, False),
                 )
 
-            relaxed_pdb_path = result_dir.joinpath(f"{prefix}_relaxed_{model_name}.pdb")
-            relaxed_pdb_path.write_text(relaxed_pdb_str)
-            relaxed_pdb_lines.append(relaxed_pdb_str)
+            protein_lines = protein.to_pdb(unrelaxed_protein)
+            unrelaxed_pdb_path = result_dir.joinpath(f"{prefix}_unrelaxed_{model_names[-1]}.pdb")
+            unrelaxed_pdb_path.write_text(protein_lines)
+
+            representations.append(prediction_result.get("representations", None))
+            unrelaxed_pdb_lines.append(protein_lines)
+            plddts.append(prediction_result["plddt"][:seq_len])
+            ptmscore.append(prediction_result["ptm"])
+            if model_type.startswith("AlphaFold2-multimer"):
+                iptmscore.append(prediction_result["iptm"])
+            max_paes.append(prediction_result["max_predicted_aligned_error"].item())
+            paes_res = []
+
+            for i in range(seq_len):
+                paes_res.append(prediction_result["predicted_aligned_error"][i][:seq_len])
+            paes.append(paes_res)
+
+            if do_relax:
+                patch_openmm()
+
+                from alphafold.common import residue_constants
+                from alphafold.relax import relax
+
+                start = time.time()
+
+                ###
+                # stereo_chemical_props.txt is from openstructure, see openstructure/README.md
+                # Hack so that we don't need to load the file into the alphafold package
+                stereo_chemical_props = (
+                    Path(__file__)
+                    .parent.absolute()
+                    .joinpath("openstructure", "stereo_chemical_props.txt")
+                )
+
+                residue_constants.stereo_chemical_props_path = stereo_chemical_props
+
+                # Remove the padding because unlike to_pdb() amber doesn't handle that
+                remove_padding_mask = np.array(unrelaxed_protein.atom_mask.sum(axis=-1) > 0)
+                unrelaxed_protein = Protein(
+                    atom_mask=unrelaxed_protein.atom_mask[remove_padding_mask],
+                    atom_positions=unrelaxed_protein.atom_positions[remove_padding_mask],
+                    aatype=unrelaxed_protein.aatype[remove_padding_mask],
+                    residue_index=unrelaxed_protein.residue_index[remove_padding_mask],
+                    b_factors=unrelaxed_protein.b_factors[remove_padding_mask],
+                    chain_index=unrelaxed_protein.chain_index[remove_padding_mask],
+                )
+
+                # Relax the prediction.
+                amber_relaxer = relax.AmberRelaxation(
+                    max_iterations=0,
+                    tolerance=2.39,
+                    stiffness=10.0,
+                    exclude_residues=[],
+                    max_outer_iterations=20,
+                    use_gpu=use_gpu_relax,
+                )
+                relaxed_pdb_str, _, _ = amber_relaxer.process(prot=unrelaxed_protein)
+
+                relax_time = time.time() - start
+                relax_times.append(relax_time)
+
+                logger.info(f"Relaxation took {relax_time:.1f}s")
+
+                if prediction_callback is not None:
+                    prediction_callback(
+                        protein.from_pdb_string(relaxed_pdb_str),
+                        sequences_lengths,
+                        prediction_result,
+                        input_features,
+                        (model_name, True),
+                    )
+
+                relaxed_pdb_path = result_dir.joinpath(f"{prefix}_relaxed_{model_names[-1]}.pdb")
+                relaxed_pdb_path.write_text(relaxed_pdb_str)
+                relaxed_pdb_lines.append(relaxed_pdb_str)
+            
+            # early stop criteria fulfilled
+            if mean_score > stop_at_score or mean_score < stop_at_score_below: break
+
         # early stop criteria fulfilled
-        if mean_score > stop_at_score or mean_score < stop_at_score_below:
-            break
+        if mean_score > stop_at_score or mean_score < stop_at_score_below: break
 
     # rerank models based on predicted lddt
     if rank_by == "ptmscore":
@@ -1195,9 +1204,9 @@ def run(
     data_dir: Union[str, Path] = default_data_dir,
     host_url: str = DEFAULT_API_SERVER,
     random_seed: int = 0,
+    num_seeds: int = 1,
     stop_at_score: float = 100,
     recompile_padding: float = 1.1,
-    recompile_all_models: bool = False,
     zip_results: bool = False,
     prediction_callback: Callable[[Any, Any, Any, Any, Any], Any] = None,
     save_single_representations: bool = False,
@@ -1207,6 +1216,7 @@ def run(
     stop_at_score_below: float = 0,
     dpi: int = 200,
     max_msa: str = None,
+    fuse: bool = True,
 ):
     from alphafold.notebooks.notebook_utils import get_pae_json
     from colabfold.alphafold.models import load_models_and_params
@@ -1222,6 +1232,8 @@ def run(
         model_extension = "_multimer"
     elif model_type == "AlphaFold2-multimer-v2":
         model_extension = "_multimer_v2"
+    elif model_type == "AlphaFold2-multimer-v3":
+        model_extension = "_multimer_v3"
     elif model_type == "AlphaFold2-ptm":
         model_extension = "_ptm"
     else:
@@ -1255,8 +1267,8 @@ def run(
         "stop_at_score": stop_at_score,
         "stop_at_score_below": stop_at_score_below,
         "random_seed": random_seed,
+        "num_seeds": num_seeds,
         "recompile_padding": recompile_padding,
-        "recompile_all_models": recompile_all_models,
         "commit": get_commit(),
         "is_training": training,
         "version": importlib_metadata.version("colabfold"),
@@ -1283,12 +1295,12 @@ def run(
         model_order,
         model_extension,
         data_dir,
-        recompile_all_models,
         stop_at_score=stop_at_score,
         rank_by=rank_by,
         return_representations=save_representations,
         training=training,
         max_msa=max_msa,
+        fuse=fuse,
     )
     if custom_template_path is not None:
         mk_hhsearch_db(custom_template_path)
@@ -1408,6 +1420,7 @@ def run(
                 prediction_callback=prediction_callback,
                 use_gpu_relax=use_gpu_relax,
                 random_seed=random_seed,
+                num_seeds=num_seeds,
             )
         except RuntimeError as e:
             # This normally happens on OOM. TODO: Filter for the specific OOM error message
@@ -1521,7 +1534,7 @@ def run(
 
 def set_model_type(is_complex: bool, model_type: str) -> str:
     if model_type == "auto" and is_complex:
-        model_type = "AlphaFold2-multimer-v2"
+        model_type = "AlphaFold2-multimer-v3"
     elif model_type == "auto" and not is_complex:
         model_type = "AlphaFold2-ptm"
     return model_type
@@ -1555,16 +1568,24 @@ def main():
 
     parser.add_argument(
         "--num-recycle",
-        help="Number of prediction cycles."
+        help="Number of prediction recycles."
         "Increasing recycles can improve the quality but slows down the prediction.",
         type=int,
         default=3,
     )
 
+
     parser.add_argument(
         "--num-ensemble",
         help="Number of ensembles."
         "The trunk of the network is run multiple times with different random choices for the MSA cluster centers.",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--num-seeds",
+        help="Number of seeds to try. Will iterate from range(random_seed, random_seed+num_seeds)."
+        ".",
         type=int,
         default=1,
     )
@@ -1606,7 +1627,7 @@ def main():
     parser.add_argument(
         "--model-type",
         help="predict strucutre/complex using the following model."
-        'Auto will pick "AlphaFold2" (ptm) for structure predictions and "AlphaFold2-multimer-v2" for complexes.',
+        'Auto will pick "AlphaFold2" (ptm) for structure predictions and "AlphaFold2-multimer-v3" for complexes.',
         type=str,
         default="auto",
         choices=[
@@ -1614,6 +1635,7 @@ def main():
             "AlphaFold2-ptm",
             "AlphaFold2-multimer-v1",
             "AlphaFold2-multimer-v2",
+            "AlphaFold2-multimer-v3",
         ],
     )
 
@@ -1773,9 +1795,9 @@ def main():
         data_dir=data_dir,
         host_url=args.host_url,
         random_seed=args.random_seed,
+        num_seeds=args.num_seeds,
         stop_at_score=args.stop_at_score,
         recompile_padding=args.recompile_padding,
-        recompile_all_models=args.recompile_all_models,
         zip_results=args.zip,
         save_single_representations=args.save_single_representations,
         save_pair_representations=args.save_pair_representations,
