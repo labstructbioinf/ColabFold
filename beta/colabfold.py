@@ -72,19 +72,39 @@ def run_mmseqs2(x, prefix, use_env=True, use_filter=True,
       query += f">{n}\n{seq}\n"
       n += 1
       
-    res = requests.post(f'{host_url}/ticket/msa', data={'q':query,'mode': mode})
+    while True:
+      try:
+        # https://requests.readthedocs.io/en/latest/user/advanced/#advanced
+        # "good practice to set connect timeouts to slightly larger than a multiple of 3"
+        res = requests.post(f'{host_url}/ticket/msa', data={'q':query,'mode': mode}, timeout=6.02)
+      except requests.exceptions.Timeout:
+        continue
+      break
+
     try: out = res.json()
     except ValueError: out = {"status":"UNKNOWN"}
     return out
 
   def status(ID):
-    res = requests.get(f'{host_url}/ticket/{ID}')
+    while True:
+      try:
+        res = requests.get(f'{host_url}/ticket/{ID}', timeout=6.02)
+      except requests.exceptions.Timeout:
+        continue
+      break
+
     try: out = res.json()
     except ValueError: out = {"status":"UNKNOWN"}
     return out
 
   def download(ID, path):
-    res = requests.get(f'{host_url}/result/download/{ID}')
+    while True:
+      try:
+        res = requests.get(f'{host_url}/result/download/{ID}', timeout=6.02)
+      except requests.exceptions.Timeout:
+        continue
+      break
+
     with open(path,"wb") as out: out.write(res.content)
   
   # process input x
@@ -184,7 +204,7 @@ def run_mmseqs2(x, prefix, use_env=True, use_filter=True,
       if not os.path.isdir(TMPL_PATH):
         os.mkdir(TMPL_PATH)
         TMPL_LINE = ",".join(TMPL[:20])
-        os.system(f"curl -s https://a3m-templates.mmseqs.com/template/{TMPL_LINE} | tar xzf - -C {TMPL_PATH}/")
+        os.system(f"curl -s {host_url}/template/{TMPL_LINE} | tar xzf - -C {TMPL_PATH}/")
         os.system(f"cp {TMPL_PATH}/pdb70_a3m.ffindex {TMPL_PATH}/pdb70_cs219.ffindex")
         os.system(f"touch {TMPL_PATH}/pdb70_cs219.ffdata")
       template_paths[k] = TMPL_PATH

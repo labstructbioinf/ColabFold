@@ -77,7 +77,25 @@ def run_mmseqs2(x, prefix, use_env=True, use_filter=True,
       query += f">{n}\n{seq}\n"
       n += 1
 
-    res = requests.post(f'{host_url}/{submission_endpoint}', data={'q':query,'mode': mode})
+    while True:
+      error_count = 0
+      try:
+        # https://requests.readthedocs.io/en/latest/user/advanced/#advanced
+        # "good practice to set connect timeouts to slightly larger than a multiple of 3"
+        res = requests.post(f'{host_url}/{submission_endpoint}', data={'q':query,'mode': mode}, timeout=6.02)
+      except requests.exceptions.Timeout:
+        logger.warning("Timeout while submitting to MSA server. Retrying...")
+        continue
+      except Exception as e:
+        error_count += 1
+        logger.warning(f"Error while fetching result from MSA server. Retrying... ({error_count}/5)")
+        logger.warning(f"Error: {e}")
+        time.sleep(5)
+        if error_count > 5:
+          raise
+        continue
+      break
+
     try:
       out = res.json()
     except ValueError:
@@ -86,7 +104,22 @@ def run_mmseqs2(x, prefix, use_env=True, use_filter=True,
     return out
 
   def status(ID):
-    res = requests.get(f'{host_url}/ticket/{ID}')
+    while True:
+      error_count = 0
+      try:
+        res = requests.get(f'{host_url}/ticket/{ID}', timeout=6.02)
+      except requests.exceptions.Timeout:
+        logger.warning("Timeout while fetching status from MSA server. Retrying...")
+        continue
+      except Exception as e:
+        error_count += 1
+        logger.warning(f"Error while fetching result from MSA server. Retrying... ({error_count}/5)")
+        logger.warning(f"Error: {e}")
+        time.sleep(5)
+        if error_count > 5:
+          raise
+        continue
+      break
     try:
       out = res.json()
     except ValueError:
@@ -95,7 +128,22 @@ def run_mmseqs2(x, prefix, use_env=True, use_filter=True,
     return out
 
   def download(ID, path):
-    res = requests.get(f'{host_url}/result/download/{ID}')
+    error_count = 0
+    while True:
+      try:
+        res = requests.get(f'{host_url}/result/download/{ID}', timeout=6.02)
+      except requests.exceptions.Timeout:
+        logger.warning("Timeout while fetching result from MSA server. Retrying...")
+        continue
+      except Exception as e:
+        error_count += 1
+        logger.warning(f"Error while fetching result from MSA server. Retrying... ({error_count}/5)")
+        logger.warning(f"Error: {e}")
+        time.sleep(5)
+        if error_count > 5:
+          raise
+        continue
+      break
     with open(path,"wb") as out: out.write(res.content)
 
   # process input x
@@ -211,9 +259,30 @@ def run_mmseqs2(x, prefix, use_env=True, use_filter=True,
       if not os.path.isdir(TMPL_PATH):
         os.mkdir(TMPL_PATH)
         TMPL_LINE = ",".join(TMPL[:20])
-        os.system(f"curl -s -L {host_url}/template/{TMPL_LINE} | tar xzf - -C {TMPL_PATH}/")
-        os.system(f"cp {TMPL_PATH}/pdb70_a3m.ffindex {TMPL_PATH}/pdb70_cs219.ffindex")
-        os.system(f"touch {TMPL_PATH}/pdb70_cs219.ffdata")
+        response = None
+        while True:
+          error_count = 0
+          try:
+            # https://requests.readthedocs.io/en/latest/user/advanced/#advanced
+            # "good practice to set connect timeouts to slightly larger than a multiple of 3"
+            response = requests.get(f"{host_url}/template/{TMPL_LINE}", stream=True, timeout=6.02)
+          except requests.exceptions.Timeout:
+            logger.warning("Timeout while submitting to template server. Retrying...")
+            continue
+          except Exception as e:
+            error_count += 1
+            logger.warning(f"Error while fetching result from template server. Retrying... ({error_count}/5)")
+            logger.warning(f"Error: {e}")
+            time.sleep(5)
+            if error_count > 5:
+              raise
+            continue
+          break
+        with tarfile.open(fileobj=response.raw, mode="r|gz") as tar:
+          tar.extractall(path=TMPL_PATH)
+        os.symlink("pdb70_a3m.ffindex", f"{TMPL_PATH}/pdb70_cs219.ffindex")
+        with open(f"{TMPL_PATH}/pdb70_cs219.ffdata", "w") as f:
+          f.write("")
       template_paths[k] = TMPL_PATH
 
   # gather a3m lines
